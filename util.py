@@ -55,7 +55,7 @@ def load_graph(frozen_graph_filename):
     """
     load a pb graph, this file is from pix_lab/util/util.py of the ARU-Net
     """
-    import tf
+    import tensorflow as tf
     # We load the protobuf file from the disk and parse it to retrieve the
     # unserialized graph_def
     with tf.gfile.GFile(frozen_graph_filename, "rb") as f:

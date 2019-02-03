@@ -1,17 +1,14 @@
 """"
-Compute map of baselines using a pre-trained ARU-Net model (pb file)
-
-Remarks: some functionality is taken directly from the pixlab file (esp.
-run_demo_inference.py)
+compute map of baselines
 """
 
 from __future__ import print_function, division
 
 import argparse
 import os
+import tensorflow as tf
 import numpy as np
 from scipy import misc
-import tensorflow as tf
 from util import getFiles, getProgressBar, load_graph
 from PIL import Image
 
@@ -30,6 +27,7 @@ class Inference_pb(object):
 
     """
     def __init__(self, path_to_pb, files, scale=0.5, 
+                 to_line=False,
                  prune_method='simple',
                  outdir=None, out_suffix=None, gpu_device='0',
                  test_orientation=True):
@@ -37,6 +35,7 @@ class Inference_pb(object):
         parameter:
             path_to_pb: path to trained tensorflow pb file
             files: list of image file paths
+            to_line: approximate line height and write a line map
             scale: scale-factor, typically ARU-Net works well on low scales,
                 which speeds up the inference a lot
             prune_method: options=['simple'] TODO: extent
@@ -49,6 +48,7 @@ class Inference_pb(object):
         """
         self.graph = load_graph(path_to_pb)
         self.files = files
+        self.to_line = to_line
         self.scale = scale
         self.prune_method = prune_method
         self.outdir = outdir
@@ -142,11 +142,15 @@ class Inference_pb(object):
                     print('WARNING: no baseline found for img:'
                           ' {}'.format(self.files[i]))
 
+                if self.to_line:
+                    out = baseToLine(out)
+
                 # save it
                 name = os.path.splitext(os.path.basename(self.files[i]))[0]
                 suffix = self.out_suffix if self.out_suffix else ''
                 path = os.path.join(self.outdir, '{}{}.png'.format(name,suffix))
 #                print('save to: {}'.format(path))
+                out = out * 255
                 misc.imsave(path, out)
             
         return pred
@@ -166,9 +170,9 @@ class Inference_pb(object):
             bl = aru_prediction[0,:,:,0] 
             other = aru_prediction[0,:,:,2] 
             # binarization
-            b = 0.4 # see paper
+            b = 0.4
             # take both classes into account
-            out = np.where(np.logical_and(bl > b,other < b), 1.0, 0)
+            out = np.where(np.logical_and(bl > b, other < b), 1.0, 0)
             # remove some holes and single items
             # important step, otherwise the skeleton will have many small
             # branches
@@ -183,15 +187,64 @@ class Inference_pb(object):
             # deprecated, use:
             out = np.array(Image.fromarray(out).resize(size,
                                                        resample=Image.NEAREST))
+            # TODO: replace w. opencv cv2.resize
+
             # now let's get only single pixel lines
 #            misc.imsave(os.path.join(self.outdir,'tmp2.png'), out)
             out = skeletonize(out) 
-            out = out * 255
         else:
             print('not implemented yet')
 
         return out
 
+def baseToLine(base_map):
+    """
+    baselines to lines
+    Note: crude approximation
+    """
+    from sklearn.mixture import GMM
+
+    # choose a set of random points of the baselines
+    pts = np.nonzero(base_map) # -> ([y1,y2,...],[x1,x2,...])
+    pts = np.array(pts).T # -> shape: n_pts x 2
+    n_pts = len(pts)
+    n_select = 5000
+    ind = np.random.choice(n_pts, min(n_pts, n_select), replace=False)
+    
+    # TODO: is there a simpler/more elegant method? 
+    all_dists = []
+    for i in range(len(ind)):
+        y,x = pts[ind[i]]
+        # go upwards until we hit another pt
+        # min distance = 5 pixels
+        for yy in range(y-5, 0, -1): 
+            if base_map[yy,x] > 0:
+                all_dists.append(y-yy)
+                break
+#    print(all_dists)
+    # mode maybe not so good
+#    modals, counts = np.unique(all_dists, return_counts=True)
+    # maximum occuring distance
+#    max_occ_dist = modals[np.argmax(counts)]
+#    max_occ_dist = np.mean(all_dists)
+#    print('max occ distance: {}'.format(max_occ_dist))
+
+    # let's fit a GMM w. 2 components
+    gmm = GMM(n_components=2, covariance_type='diag', n_iter=100)
+    gmm.fit(np.array(all_dists).reshape(-1,1))
+    mean = gmm.means_[np.argmin(gmm.means_)]
+    dist = mean
+
+    # now fill the line
+    # take only a certain percentage of it for the line representation
+    # of course a connected component approach or similar would maybe be better
+    perc = 0.6
+    # use dilation operator for fast filling (CV skills ftw ;) 
+    dst = np.array(base_map.shape, dtype=np.uint8)
+    elem = np.ones( (int(dist * perc), 1), dtype=np.uint8)
+    dst = cv2.dilate(base_map.astype(np.uint8), elem, dst, anchor=(0,0))
+
+    return dst
 
 def parseArgs(parser):
     parser.add_argument('--file', 
@@ -209,6 +262,8 @@ def parseArgs(parser):
     parser.add_argument('--scale', type=float, default=0.25,
                         help='scale factor for processing, final line map will'
                         ' be upscaled again')
+    parser.add_argument('--to_line', action='store_true',
+                        help='estiamte line height and approximate a line')
     parser.add_argument('-o', '--outdir',
                         help='path for outputfolder'
                         ' if not given: use input folder')
@@ -221,7 +276,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('lines')
     parser = parseArgs(parser)
     args = parser.parse_args()
-    
+   
+    np.random.seed(42)
+
     if args.indir:
         assert(os.path.exists(args.indir))
     if args.outdir:
@@ -241,7 +298,8 @@ if __name__ == '__main__':
         files, _ = getFiles(args.indir, args.suffix, args.labels)
     assert(len(files) > 0)
 
-    infer = Inference_pb(args.aru_model, files, args.scale, 
+    infer = Inference_pb(args.aru_model, files, args.scale,
+                         to_line=args.to_line,
                          outdir=outdir,
                          out_suffix=args.out_suffix)
     infer.applyARUNet()
